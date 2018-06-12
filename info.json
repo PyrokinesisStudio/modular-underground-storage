@@ -1,0 +1,11 @@
+{
+  "name": "modular-underground-storage",
+  "version": "0.1.0",
+  "factorio_version": "0.16",
+  "title": "Modular Underground Storage",
+  "author": "Harag",
+  "contact": "",
+  "homepage": "",
+  "description": "Place underground storage tiles in arbitrary shapes and get items in and out of them via underground belts",
+  "dependencies": ["base"]
+}
