@@ -4,6 +4,13 @@ local MOD = "modular-underground-storage"
 local TILE = "modular-underground-storage-tile"
 local TILE_STACK = { name = TILE }
 
+local LOADERS = {}
+LOADERS["deadlock-loader-1"] = true
+LOADERS["deadlock-loader-2"] = true
+LOADERS["deadlock-loader-3"] = true
+LOADERS["deadlock-loader-4"] = true
+LOADERS["deadlock-loader-5"] = true
+
 -- This code uses positions as table keys.
 -- Because Lua compares tables by their reference only that means positions have to be encoded as numbers.
 -- Factorio runs scripts in Lua 5.2 which means numbers are float64.
@@ -68,7 +75,6 @@ end
 local function perSurfaceData(surface, createIfNecessary)
     local surfaceData = perSurface[surface.index]
     if not surfaceData then
-        player_print("tracking new surface ".. surface.index)        
         surfaceData = {
             next_id = 1,
             patches = {},
@@ -76,7 +82,6 @@ local function perSurfaceData(surface, createIfNecessary)
         }
         if createIfNecessary then 
             perSurface[surface.index] = surfaceData
-            player_print("persisting data for surface ".. surface.index)
         end
     end
     return surfaceData
@@ -161,9 +166,18 @@ local function mightBeSplit(surface, pos)
     return disconnected > 1
 end
 
-Storage.newTile = function(surface, pos)
-    player_print("new tile at " .. posToString(pos))
+Patch.create = function()
+    return {
+        tiles = {}, -- pos -> true
+        tileCount = 0,
+        items = {}, -- item.name -> count
+        itemCount = 0,
+        inputs = {},
+        outputs = {},
+    }
+end
 
+Storage.newTile = function(surface, pos)
     local surfaceData = perSurfaceData(surface, true)
 
     local lastPatch = nil
@@ -177,7 +191,7 @@ Storage.newTile = function(surface, pos)
                 lastPatch = Storage.mergePatches(surfaceData, patch, lastPatch)
             end
         else
-            player_print("loose tile at " .. posToString(adjacentPos))
+            -- loose tile, this only happens when the tile cursor is larger than 1x1
             if lastPatch then
                 Storage.addToPatch(surfaceData, lastPatch, adjacentPos)
             else
@@ -189,18 +203,15 @@ Storage.newTile = function(surface, pos)
     if lastPatch then
         Storage.addToPatch(surfaceData, lastPatch, pos)
     else
-        Storage.newPatch(surfaceData, pos)
+        lastPatch = Storage.newPatch(surfaceData, pos)
     end
-end
 
-Patch.create = function()
-    return {
-        tiles = {}, -- pos -> true
-        tileCount = 0,
-        items = {}, -- item.name -> count
-        inputs = {},
-        outputs = {},
-    }
+    local x, y = toCoords(pos)
+    local undergroundBelt = surface.find_entities_filtered {area={{x,y},{x+1,y+1}}, type="underground-belt"}[1]
+
+    if undergroundBelt then
+        Storage.addInputOrOutput(surfaceData, lastPatch, pos, undergroundBelt)
+    end
 end
 
 Storage.newPatch = function(surfaceData, pos)
@@ -212,8 +223,6 @@ Storage.newPatch = function(surfaceData, pos)
     surfaceData.patches[newPatch.id] = newPatch
     surfaceData.lookup[pos] = newPatch
 
-    player_print("new patch " .. newPatch.id)
-
     return newPatch
 end
 
@@ -221,7 +230,6 @@ Storage.addToPatch = function(surfaceData, patch, pos)
     if not patch.tiles[pos] then
         patch.tiles[pos] = true
         patch.tileCount = patch.tileCount + 1
-        player_print("added ".. posToString(pos) .. " to patch " .. patch.id)
     end
     surfaceData.lookup[pos] = patch
 end
@@ -231,13 +239,12 @@ Storage.removeFromPatch = function(surfaceData, patch, pos)
         patch.tiles[pos] = nil
         patch.tileCount = patch.tileCount - 1
         surfaceData.lookup[pos] = nil
-        player_print("removed ".. posToString(pos) .. " from patch " .. patch.id)
     end
 end
 
 Storage.mergePatches = function(surfaceData, patch1, patch2)
     local from, into
-    if #patch1.tiles < #patch2.tiles then
+    if patch1.tileCount < patch2.tileCount then
         from = patch1
         into = patch2
     else
@@ -250,8 +257,14 @@ Storage.mergePatches = function(surfaceData, patch1, patch2)
     end
 
     for name, count in pairs(from.items) do
-        into.items[name] = (into.items[name] or 0) + count
+        local storedCount = into.items[name]
+        if not storedCount then
+            into.items[name] = count
+        else
+            into.items[name] = storedCount + count
+        end
     end
+    into.itemCount = into.itemCount + from.itemCount
 
     for pos, entity in pairs(from.inputs) do
         into.inputs[pos] = entity
@@ -261,7 +274,6 @@ Storage.mergePatches = function(surfaceData, patch1, patch2)
     end
 
     surfaceData.patches[from.id] = nil
-    player_print("merged patch " .. from.id .. " into patch " .. into.id)
 
     return into
 end
@@ -281,14 +293,24 @@ Storage.removeTile = function(surface, pos)
     Storage.removeFromPatch(surfaceData, patch, pos)
 
     if not next(patch.tiles) then
+        -- dissolve empty patch
         surfaceData.patches[patch.id] = nil
-        -- perSurface.lookup cannot have references when tiles is empty
-        player_print("dissolved patch " .. patch.id)
+        -- surfaceData.lookup cannot have references when tiles is empty
 
     elseif mightBeSplit(surface, pos) then
         Storage.splitIfNecessary(surfaceData, patch)
     end
 
+    return true
+end
+
+Storage.isTileRemovable = function(surface, pos)
+    -- TODO this is hard to decide without actually doing it
+    -- for now just allow it here and deny it later in removeTile()
+    -- if that would completely destroy a patch that still has items
+
+    -- implementing this would allow to unmark tiles marked for deconstruction
+    -- if that would reduce the capacity of the patch below the stored item count
     return true
 end
 
@@ -305,11 +327,10 @@ local function floodFill(sourcePatch, fill, x, y)
 end
 
 Storage.splitIfNecessary = function(surfaceData, patch)
-    local splits = {}
     local maxTileCount = -1
     local largestPatch = nil
 
-    for i = 1,4 do
+    for i = 1, 4 do -- removing one tile can produce at most 4 split patches
         local pos = next(patch.tiles)
         local newPatch = Patch.create()
         newPatch.tiles[pos] = true
@@ -318,9 +339,10 @@ Storage.splitIfNecessary = function(surfaceData, patch)
         local x, y = toCoords(pos)
         floodFill(patch, newPatch, x, y)
 
-        -- remaining tiles in patch are contigous
+        -- remaining tiles in patch are contiguous, the algorithm is done
         if newPatch.tileCount == patch.tileCount then break end
 
+        -- found split, move data to it and make it permanent
         newPatch.id = surfaceData.next_id
         surfaceData.patches[newPatch.id] = newPatch
         surfaceData.next_id = surfaceData.next_id + 1
@@ -329,9 +351,17 @@ Storage.splitIfNecessary = function(surfaceData, patch)
             patch.tiles[pos] = nil
             patch.tileCount = patch.tileCount - 1
             surfaceData.lookup[pos] = newPatch
-        end
 
-        table.insert(splits, newPatch)
+            if patch.inputs[pos] then
+                newPatch.inputs[pos] = patch.inputs[pos]
+                patch.inputs[pos] = nil
+            end
+
+            if patch.outputs[pos] then
+                newPatch.outputs[pos] = patch.outputs[pos]
+                patch.outputs[pos] = nil
+            end
+        end
 
         if newPatch.tileCount > maxTileCount then
             largestPatch = newPatch
@@ -339,16 +369,126 @@ Storage.splitIfNecessary = function(surfaceData, patch)
         end
     end
 
+    -- move all stored items to the largest patch, even when they don't all fit
     if largestPatch and maxTileCount > patch.tileCount then
         largestPatch.items = patch.items
+        largestPatch.itemCount = patch.itemCount
         patch.items = {}
+        patch.itemCount = 0
+    end
+end
+
+local function inputOutput(entity)
+    return (entity.valid and entity.type == "loader" and entity.loader_type) or nil
+end
+
+Storage.addInputOrOutput = function(surfaceData, patch, pos, entity)
+    if (entity.type == "loader") then
+        patch.inputs[pos] = entity
     end
 
-    if #splits > 0 then
-        player_print("split " .. #splits .. " patches from patch " .. patch.id)
-    end
+    -- recheck all inputs and outputs, snapping might have changed them
 
-    -- TODO handle inputs and outputs
+    for pos, entity in pairs(patch.inputs) do
+        local inOut = inputOutput(entity)
+        if inOut == "input" then
+            patch.inputs[pos] = entity
+            patch.outputs[pos] = nil
+        elseif inOut == "output" then
+            patch.inputs[pos] = nil
+            patch.outputs[pos] = entity
+        else
+            patch.inputs[pos] = nil
+            patch.outputs[pos] = nil
+        end
+    end
+        
+    for pos, entity in pairs(patch.inputs) do
+        local inOut = inputOutput(entity)
+        if inOut == "input" then
+            patch.inputs[pos] = entity
+            patch.outputs[pos] = nil
+        elseif inOut == "output" then
+            patch.inputs[pos] = nil
+            patch.outputs[pos] = entity
+        else
+            patch.inputs[pos] = nil
+            patch.outputs[pos] = nil
+        end
+    end
+end
+
+function doOutput(patch, output, filter, unfiltered, linedef, tick)
+    local item = filter
+    if not item and unfiltered then 
+        item = next(patch.items)
+    end
+    if not item then return end
+
+    local count = patch.items[item]
+    if not count then return end
+
+    local line = output.get_transport_line(linedef)
+    if not line.insert_at_back({name = item}) then return end
+
+    count = count - 1
+    if count > 0 then
+        patch.items[item] = count
+    else
+        patch.items[item] = nil
+    end
+    patch.itemCount = patch.itemCount - 1
+end
+
+function doInput(patch, input, maxItems, linedef)
+    if patch.itemCount >= maxItems then return end
+
+    local line = input.get_transport_line(linedef)
+
+    local frontItem = #line > 0 and line[1]
+    if not frontItem then return end
+
+    local item = frontItem.name
+
+    local removed = line.remove_item({name = item})
+    if removed < 1 then return end
+
+    local count = patch.items[item]
+    if not count then
+        patch.items[item] = 1
+    else
+        patch.items[item] = count + 1
+    end
+    patch.itemCount = patch.itemCount + 1
+end
+
+local LEFT_LINE = defines.transport_line.left_line
+local RIGHT_LINE = defines.transport_line.right_line
+
+function tick(event)
+    for _, surfaceData in pairs(perSurface) do
+        for _, patch in pairs(surfaceData.patches) do
+            for _, output in pairs(patch.outputs) do
+                if output.valid then
+                    local filterL = output.get_filter(1)
+                    local filterR = output.get_filter(2)
+                    local unfiltered = (not filterL) and (not filterR)
+
+                    doOutput(patch, output, filterL, unfiltered, LEFT_LINE, event.tick)
+                    doOutput(patch, output, filterR, unfiltered, RIGHT_LINE, 2)
+                end
+            end
+
+            local maxItems = patch.tileCount * 2000
+
+            for _, input in pairs(patch.inputs) do
+                if input.valid then
+                    doInput(patch, input, maxItems, LEFT_LINE)
+                    doInput(patch, input, maxItems, RIGHT_LINE)
+                end
+            end
+        end
+    end
 end
 
 function player_or_robot(event)
@@ -396,17 +536,73 @@ function tile_built(event)
     end
 end
 
+function entity_built(event)
+    if event.created_entity.type ~= "underground-belt" then return end
+
+    local actor = player_or_robot(event)
+    if actor.surface.get_tile(actor.position).name == TILE then
+        surfaceData = perSurfaceData(actor.surface, false)
+        Storage.addUndergroundBelt(surfaceData, event.created_entity)
+    end
+end
+
+function getPatchUnderEntity(entity)
+    local x = math.floor(entity.position.x)
+    local y = math.floor(entity.position.y)
+    if entity.surface.get_tile(x,y).name ~= TILE then return end
+
+    local surfaceData = perSurfaceData(entity.surface, false)
+    if not surfaceData then return end
+
+    local pos = toPos(x,y)
+    local patch = surfaceData.lookup[pos]
+    if not patch then return end
+
+    return surfaceData, patch, pos
+end
+
+function entity_built(event)
+    local entity = event.created_entity
+    
+    if LOADERS[entity.name] then 
+        local surfaceData, patch, pos = getPatchUnderEntity(entity)
+        if surfaceData then
+            Storage.addInputOrOutput(surfaceData, patch, pos, entity)
+        end
+    end
+end
+
+function rotate_entity(event)
+    local entity = event.entity
+
+    if LOADERS[entity.name] then 
+        local surfaceData, patch, pos = getPatchUnderEntity(entity)
+        if surfaceData then
+            Storage.addInputOrOutput(surfaceData, patch, pos, entity)
+        end
+    end
+end
+
 script.on_init(Storage.init)
 script.on_load(Storage.init)
+script.on_event(defines.events.on_surface_deleted, function() data[event.surface_index] = nil end)
 
 script.on_event(defines.events.on_marked_for_deconstruction, marked)
 
 script.on_event(defines.events.on_robot_mined_tile, tile_mined)
 script.on_event(defines.events.on_player_mined_tile, tile_mined)
-script.on_event(defines.events.on_surface_deleted, function() data[event.surface_index] = nil end)
-
 script.on_event(defines.events.on_robot_built_tile, tile_built)
 script.on_event(defines.events.on_player_built_tile, tile_built)
+
+script.on_event(defines.events.on_built_entity, entity_built)
+script.on_event(defines.events.on_robot_built_entity, entity_built)
+script.on_event(defines.events.on_player_rotated_entity, rotate_entity)
+
+script.on_event(defines.events.on_player_mined_entity, entity_mined)
+script.on_event(defines.events.on_robot_mined_entity, entity_mined)
+
+script.on_event(defines.events.on_tick, tick)
+-- no need to handle mined_entity events, the tick function removes entities that are no longer .valid
 
 local texts = {}
 
@@ -436,23 +632,43 @@ function show(paramTable)
 end
 
 function dump(paramTable) 
-    local surface = game.players[paramTable.player_index].surface
+    local player = game.players[paramTable.player_index]
+    local surface = player.surface
     local surfaceData = perSurfaceData(surface, false)
     if not surfaceData then return end
 
     for _, patch in pairs(surfaceData.patches) do
-        player_print("#" .. patch.id .. ": " .. patch.tileCount)
+        player_print("#" .. patch.id .. ": " .. patch.tileCount .. " tiles, " .. patch.itemCount .. " items")
+        
+        local items = "   items: "
+        for item, count in pairs(patch.items) do
+            items = items .. item .. "=" .. count .. ", "
+        end
+        player_print(items)
+
+        local inputs = "   inputs: "
+        for pos, entity in pairs(patch.inputs) do
+            inputs = inputs .. posToString(pos) .. ", "
+        end
+        player_print(inputs)
+
+        local outputs = "   outputs: "
+        for pos, entity in pairs(patch.outputs) do
+            outputs = outputs .. posToString(pos) .. ", "
+        end
+        player_print(outputs)
     end
 end
 
 commands.add_command("mus",
-"Overlay storage tiles with the patch id they belong to. Also overlays underground belts that are connected to a patch.",
+"Subcommands 'show' and 'hide' overlay tiles with the storage patch id. " ..
+"'dump' prints statistics about all the patches on the player's surface.",
 function(paramTable)
     local cmd = paramTable.parameter
     if cmd == "show" then show(paramTable)
     elseif cmd == "hide" then hide(paramTable)
     elseif cmd == "dump" then dump(paramTable)
     else
-        player_print("unknown subcommand " .. cmd)
+        game.players[paramTable.player_index].print("unknown subcommand " .. cmd)
     end
 end)
