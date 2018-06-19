@@ -7,5 +7,5 @@
   "contact": "",
   "homepage": "",
   "description": "Place underground storage tiles in arbitrary shapes and get items in and out of them via underground belts",
-  "dependencies": ["base", "DeadlockLoaders"]
+  "dependencies": ["base", "DeadlockLoaders", "? bobassembly >= 0.16.0"]
 }

@@ -1,3 +1,7 @@
+-- This Source Code Form is subject to the terms of the Mozilla Public
+-- License, v. 2.0. If a copy of the MPL was not distributed with this
+-- file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 local perSurface = {}
 
 local MOD = "modular-underground-storage"
@@ -5,11 +9,12 @@ local TILE = "modular-underground-storage-tile"
 local TILE_STACK = { name = TILE }
 
 local LOADERS = {}
-LOADERS["deadlock-loader-1"] = true
-LOADERS["deadlock-loader-2"] = true
-LOADERS["deadlock-loader-3"] = true
-LOADERS["deadlock-loader-4"] = true
-LOADERS["deadlock-loader-5"] = true
+LOADERS["deadlock-loader-1"] = function(patch) return patch.loaders end
+LOADERS["deadlock-loader-2"] = LOADERS["deadlock-loader-1"]
+LOADERS["deadlock-loader-3"] = LOADERS["deadlock-loader-1"]
+LOADERS["deadlock-loader-4"] = LOADERS["deadlock-loader-1"]
+LOADERS["deadlock-loader-5"] = LOADERS["deadlock-loader-1"]
+LOADERS["constant-combinator"] = function(patch) return patch.scanners end
 
 -- This code uses positions as table keys.
 -- Because Lua compares tables by their reference only that means positions have to be encoded as numbers.
@@ -172,8 +177,10 @@ Patch.create = function()
         tileCount = 0,
         items = {}, -- item.name -> count
         itemCount = 0,
-        inputs = {},
-        outputs = {},
+        itemMaxima = {},
+        defaulItemMaximum = -1,
+        loaders = {},
+        scanners = {},
     }
 end
 
@@ -207,10 +214,11 @@ Storage.newTile = function(surface, pos)
     end
 
     local x, y = toCoords(pos)
-    local undergroundBelt = surface.find_entities_filtered {area={{x,y},{x+1,y+1}}, type="underground-belt"}[1]
-
-    if undergroundBelt then
-        Storage.addInputOrOutput(surfaceData, lastPatch, pos, undergroundBelt)
+    for _, entity in pairs(surface.find_entities({{x,y},{x+1,y+1}})) do
+        local accessor = LOADERS[entity.name]
+        if accessor then
+            accessor(lastPatch)[pos] = entity
+        end
     end
 end
 
@@ -239,6 +247,8 @@ Storage.removeFromPatch = function(surfaceData, patch, pos)
         patch.tiles[pos] = nil
         patch.tileCount = patch.tileCount - 1
         surfaceData.lookup[pos] = nil
+        patch.loaders[pos] = nil
+        patch.scanners[pos] = nil
     end
 end
 
@@ -266,12 +276,14 @@ Storage.mergePatches = function(surfaceData, patch1, patch2)
     end
     into.itemCount = into.itemCount + from.itemCount
 
-    for pos, entity in pairs(from.inputs) do
-        into.inputs[pos] = entity
+    for pos, entity in pairs(from.loaders) do
+        into.loaders[pos] = entity
     end
-    for pos, entity in pairs(from.outputs) do
-        into.outputs[pos] = entity
+    for pos, entity in pairs(from.scanners) do
+        into.scanners[pos] = entity
     end
+
+    Storage.updateItemMaxima(surfaceData, into)
 
     surfaceData.patches[from.id] = nil
 
@@ -352,15 +364,16 @@ Storage.splitIfNecessary = function(surfaceData, patch)
             patch.tileCount = patch.tileCount - 1
             surfaceData.lookup[pos] = newPatch
 
-            if patch.inputs[pos] then
-                newPatch.inputs[pos] = patch.inputs[pos]
-                patch.inputs[pos] = nil
+            if patch.loaders[pos] then
+                newPatch.loaders[pos] = patch.loaders[pos]
+                patch.loaders[pos] = nil
+            end
+            if patch.scanners[pos] then
+                newPatch.scanners[pos] = patch.scanners[pos]
+                patch.scanners[pos] = nil
             end
 
-            if patch.outputs[pos] then
-                newPatch.outputs[pos] = patch.outputs[pos]
-                patch.outputs[pos] = nil
-            end
+            Storage.updateItemMaxima(surfaceData, newPatch)
         end
 
         if newPatch.tileCount > maxTileCount then
@@ -369,60 +382,42 @@ Storage.splitIfNecessary = function(surfaceData, patch)
         end
     end
 
-    -- move all stored items to the largest patch, even when they don't all fit
-    if largestPatch and maxTileCount > patch.tileCount then
-        largestPatch.items = patch.items
-        largestPatch.itemCount = patch.itemCount
-        patch.items = {}
-        patch.itemCount = 0
-    end
-end
+    if largestPatch then -- there was at least one split
+        Storage.updateItemMaxima(surfaceData, patch)
 
-local function inputOutput(entity)
-    return (entity.valid and entity.type == "loader" and entity.loader_type) or nil
-end
-
-Storage.addInputOrOutput = function(surfaceData, patch, pos, entity)
-    if (entity.type == "loader") then
-        patch.inputs[pos] = entity
-    end
-
-    -- recheck all inputs and outputs, snapping might have changed them
-
-    for pos, entity in pairs(patch.inputs) do
-        local inOut = inputOutput(entity)
-        if inOut == "input" then
-            patch.inputs[pos] = entity
-            patch.outputs[pos] = nil
-        elseif inOut == "output" then
-            patch.inputs[pos] = nil
-            patch.outputs[pos] = entity
-        else
-            patch.inputs[pos] = nil
-            patch.outputs[pos] = nil
-        end
-    end
-        
-    for pos, entity in pairs(patch.inputs) do
-        local inOut = inputOutput(entity)
-        if inOut == "input" then
-            patch.inputs[pos] = entity
-            patch.outputs[pos] = nil
-        elseif inOut == "output" then
-            patch.inputs[pos] = nil
-            patch.outputs[pos] = entity
-        else
-            patch.inputs[pos] = nil
-            patch.outputs[pos] = nil
+        -- move all stored items to the largest patch, even when they don't all fit
+        if maxTileCount > patch.tileCount then
+            largestPatch.items = patch.items
+            largestPatch.itemCount = patch.itemCount
+            patch.items = {}
+            patch.itemCount = 0
         end
     end
 end
 
-function doOutput(patch, output, filter, unfiltered, linedef, tick)
-    local item = filter
-    if not item and unfiltered then 
-        item = next(patch.items)
+Storage.updateItemMaxima = function(surfaceData, patch)
+    patch.itemMaxima = {}
+    patch.defaultItemMaximum = -1
+
+    for _, entity in pairs(patch.scanners) do
+        local control = entity.get_control_behavior()
+        -- enabled combinators have their signals overriden with the storage-patche's content
+        -- so only disabled combinators are used to control the item maxima
+        if not control.enabled then
+            for _, param in pairs(control.parameters.parameters) do
+                local signal = param.signal
+                if signal.type == "item" and signal.name then
+                    patch.itemMaxima[signal.name] = param.count
+                elseif signal.type == "virtual" and signal.name == "signal-M" then
+                    patch.defaultItemMaximum = param.count
+                end
+            end
+        end
     end
+end
+
+function doOutput(patch, output, filter, linedef)
+    local item = output.get_filter(filter)
     if not item then return end
 
     local count = patch.items[item]
@@ -444,21 +439,27 @@ function doInput(patch, input, maxItems, linedef)
     if patch.itemCount >= maxItems then return end
 
     local line = input.get_transport_line(linedef)
-
     local frontItem = #line > 0 and line[1]
     if not frontItem then return end
 
     local item = frontItem.name
 
+    local count = patch.items[item] or 0
+    local itemMax = patch.itemMaxima[item]
+    local defaultMax = patch.defaultItemMaximum
+
+    if (itemMax 
+            and count >= itemMax) 
+    or 
+       ((not itemMax) 
+            and defaultMax >= 0 
+            and count >= defaultMax)
+    then return end
+
     local removed = line.remove_item({name = item})
     if removed < 1 then return end
 
-    local count = patch.items[item]
-    if not count then
-        patch.items[item] = 1
-    else
-        patch.items[item] = count + 1
-    end
+    patch.items[item] = count + 1
     patch.itemCount = patch.itemCount + 1
 end
 
@@ -466,25 +467,46 @@ local LEFT_LINE = defines.transport_line.left_line
 local RIGHT_LINE = defines.transport_line.right_line
 
 function tick(event)
+    local isCircuitNetworkUpdateTick = (event.tick % settings.global["modular-underground-storage-signal-update-rate"].value == 0)
+    local tileCapacity = settings.global["modular-underground-storage-tile-capacity"].value
+
     for _, surfaceData in pairs(perSurface) do
         for _, patch in pairs(surfaceData.patches) do
-            for _, output in pairs(patch.outputs) do
-                if output.valid then
-                    local filterL = output.get_filter(1)
-                    local filterR = output.get_filter(2)
-                    local unfiltered = (not filterL) and (not filterR)
-
-                    doOutput(patch, output, filterL, unfiltered, LEFT_LINE, event.tick)
-                    doOutput(patch, output, filterR, unfiltered, RIGHT_LINE, 2)
+            for _, output in pairs(patch.loaders) do
+                if output.valid and output.loader_type == "output" then
+                    doOutput(patch, output, 1, LEFT_LINE)
+                    doOutput(patch, output, 2, RIGHT_LINE)
                 end
             end
 
-            local maxItems = patch.tileCount * 2000
+            local maxItems = patch.tileCount * tileCapacity
 
-            for _, input in pairs(patch.inputs) do
-                if input.valid then
+            for _, input in pairs(patch.loaders) do
+                if input.valid and input.loader_type == "input" then
                     doInput(patch, input, maxItems, LEFT_LINE)
                     doInput(patch, input, maxItems, RIGHT_LINE)
+                end
+            end
+
+            if isCircuitNetworkUpdateTick and next(patch.scanners) then
+                local spaceLeft = math.max(maxItems - patch.itemCount, 0)
+                local signals = {}
+                signals[1] = {index = 1, signal = {type = "virtual",name = "signal-F"}, count = spaceLeft}
+                signals[2] = {index = 2, signal = {type = "virtual",name = "signal-T"}, count = maxItems }
+    
+                local index = 3
+                for item, count in pairs(patch.items) do
+                    signals[index] = {index = index, signal = {type = "item", name = item}, count = count}
+                    index = index+1
+                end
+
+                for _, scanner in pairs(patch.scanners) do
+                    if scanner.valid then
+                        local control = scanner.get_control_behavior()
+                        if control.enabled then
+                            control.parameters = {parameters = signals}
+                        end
+                    end
                 end
             end
         end
@@ -536,16 +558,6 @@ function tile_built(event)
     end
 end
 
-function entity_built(event)
-    if event.created_entity.type ~= "underground-belt" then return end
-
-    local actor = player_or_robot(event)
-    if actor.surface.get_tile(actor.position).name == TILE then
-        surfaceData = perSurfaceData(actor.surface, false)
-        Storage.addUndergroundBelt(surfaceData, event.created_entity)
-    end
-end
-
 function getPatchUnderEntity(entity)
     local x = math.floor(entity.position.x)
     local y = math.floor(entity.position.y)
@@ -564,28 +576,43 @@ end
 function entity_built(event)
     local entity = event.created_entity
     
-    if LOADERS[entity.name] then 
+    local accessor = LOADERS[entity.name]
+    if accessor then 
         local surfaceData, patch, pos = getPatchUnderEntity(entity)
         if surfaceData then
-            Storage.addInputOrOutput(surfaceData, patch, pos, entity)
+            accessor(patch)[pos] = entity
         end
     end
 end
 
-function rotate_entity(event)
+function entity_mined(event)
     local entity = event.entity
-
-    if LOADERS[entity.name] then 
+    
+    local accessor = LOADERS[entity.name]
+    if accessor then 
         local surfaceData, patch, pos = getPatchUnderEntity(entity)
         if surfaceData then
-            Storage.addInputOrOutput(surfaceData, patch, pos, entity)
+            accessor(patch)[pos] = nil
+        end
+        if entity.name == "constant-combinator" then
+            Storage.updateItemMaxima(surfaceData, patch)
         end
     end
+end
+
+function gui_closed(event)
+    local entity = event.entity
+    if not (entity and entity.valid and entity.name == "constant-combinator") then return end
+
+    local surfaceData, patch, pos = getPatchUnderEntity(entity)
+    if not surfaceData then return end
+
+    Storage.updateItemMaxima(surfaceData, patch)
 end
 
 script.on_init(Storage.init)
 script.on_load(Storage.init)
-script.on_event(defines.events.on_surface_deleted, function() data[event.surface_index] = nil end)
+script.on_event(defines.events.on_surface_deleted, function() perSurface[event.surface_index] = nil end)
 
 script.on_event(defines.events.on_marked_for_deconstruction, marked)
 
@@ -596,12 +623,11 @@ script.on_event(defines.events.on_player_built_tile, tile_built)
 
 script.on_event(defines.events.on_built_entity, entity_built)
 script.on_event(defines.events.on_robot_built_entity, entity_built)
-script.on_event(defines.events.on_player_rotated_entity, rotate_entity)
-
 script.on_event(defines.events.on_player_mined_entity, entity_mined)
 script.on_event(defines.events.on_robot_mined_entity, entity_mined)
 
 script.on_event(defines.events.on_tick, tick)
+script.on_event(defines.events.on_gui_closed, gui_closed)
 -- no need to handle mined_entity events, the tick function removes entities that are no longer .valid
 
 local texts = {}
@@ -647,14 +673,18 @@ function dump(paramTable)
         player_print(items)
 
         local inputs = "   inputs: "
-        for pos, entity in pairs(patch.inputs) do
-            inputs = inputs .. posToString(pos) .. ", "
+        for pos, entity in pairs(patch.loaders) do
+            if entity.loader_type == "input" then
+                inputs = inputs .. posToString(pos) .. ", "
+            end
         end
         player_print(inputs)
 
         local outputs = "   outputs: "
-        for pos, entity in pairs(patch.outputs) do
-            outputs = outputs .. posToString(pos) .. ", "
+        for pos, entity in pairs(patch.loaders) do
+            if entity.loader_type == "output" then
+                outputs = outputs .. posToString(pos) .. ", "
+            end
         end
         player_print(outputs)
     end

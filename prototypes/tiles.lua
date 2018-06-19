@@ -1,6 +1,29 @@
+-- This Source Code Form is subject to the terms of the Mozilla Public
+-- License, v. 2.0. If a copy of the MPL was not distributed with this
+-- file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 local GRAPHICS = "__modular-underground-storage__/graphics/"
 local TERRAIN = GRAPHICS .. "terrain/asphalt/"
 local BASE_CONCRETE = data.raw["tile"]["concrete"]
+local BASE_CHEST = data.raw.item["steel-chest"]
+
+local function determineIngredients()
+    if data.raw["assembling-machine"]["electronics-machine-1"] then
+        return {
+            { "red-filter-inserter", 5 },
+            { "concrete", 10 },
+            { "red-wire", 20 },
+            { "green-wire", 20 },
+        }
+    else 
+        return {
+            { "filter-inserter", 6 },
+            { "concrete", 10 },
+            { "red-wire", 20 },
+            { "green-wire", 20 },
+        }
+    end
+end
 
 data:extend({
     {
@@ -38,9 +61,10 @@ data:extend({
         icon = GRAPHICS .. "icons/asphalt-hazard-green.png",
         icon_size = 32,
         flags = { "goes-to-quickbar" },
-        subgroup = subgrp,
-        order = "a-a",
-        stack_size = 200,
+        group = BASE_CHEST.group,
+        subgroup = BASE_CHEST.subgroup,
+        order = BASE_CHEST.order .. "-a",
+        stack_size = 50,
         place_as_tile =
         {
             result = "modular-underground-storage-tile",
@@ -52,13 +76,12 @@ data:extend({
         type = "recipe",
         name = "modular-underground-storage-tile",
         energy_required = 0.25,
-        enabled = true,
+        enabled = false,
         category = "crafting",
-        ingredients = 
-        {
-            { "concrete", 1 }
-        },
-        result= "modular-underground-storage-tile",
-        result_count = 10
+        ingredients = determineIngredients(),
+        result = "modular-underground-storage-tile",
+        result_count = 1,
     }
 })
+
+table.insert(data.raw.technology['logistics-2'].effects, { type = "unlock-recipe", recipe = "modular-underground-storage-tile"})
