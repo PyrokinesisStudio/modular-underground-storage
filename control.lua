@@ -15,6 +15,11 @@ LOADERS["deadlock-loader-3"] = LOADERS["deadlock-loader-1"]
 LOADERS["deadlock-loader-4"] = LOADERS["deadlock-loader-1"]
 LOADERS["deadlock-loader-5"] = LOADERS["deadlock-loader-1"]
 LOADERS["constant-combinator"] = function(patch) return patch.scanners end
+LOADERS["logistic-chest-buffer"] = function(patch) return patch.outputChests end
+LOADERS["logistic-chest-requester"] = LOADERS["logistic-chest-buffer"]
+LOADERS["steel-chest"] = function(patch) return patch.inputChests end
+LOADERS["infinity-chest"] = LOADERS["steel-chest"]
+LOADERS["logistic-chest-storage"] = LOADERS["steel-chest"]
 
 -- This code uses positions as table keys.
 -- Because Lua compares tables by their reference only that means positions have to be encoded as numbers.
@@ -181,6 +186,8 @@ Patch.create = function()
         defaulItemMaximum = -1,
         loaders = {},
         scanners = {},
+        outputChests = {},
+        inputChests = {},
     }
 end
 
@@ -249,6 +256,8 @@ Storage.removeFromPatch = function(surfaceData, patch, pos)
         surfaceData.lookup[pos] = nil
         patch.loaders[pos] = nil
         patch.scanners[pos] = nil
+        patch.inputChests[pos] = nil
+        patch.outputChests[pos] = nil
     end
 end
 
@@ -281,6 +290,12 @@ Storage.mergePatches = function(surfaceData, patch1, patch2)
     end
     for pos, entity in pairs(from.scanners) do
         into.scanners[pos] = entity
+    end
+    for pos, entity in pairs(from.inputChests) do
+        into.inputChests[pos] = entity
+    end
+    for pos, entity in pairs(from.outputChests) do
+        into.outputChests[pos] = entity
     end
 
     Storage.updateItemMaxima(surfaceData, into)
@@ -372,6 +387,14 @@ Storage.splitIfNecessary = function(surfaceData, patch)
                 newPatch.scanners[pos] = patch.scanners[pos]
                 patch.scanners[pos] = nil
             end
+            if patch.inputChests[pos] then
+                newPatch.inputChests[pos] = patch.inputChests[pos]
+                patch.inputChests[pos] = nil
+            end
+            if patch.outputChests[pos] then
+                newPatch.outputChests[pos] = patch.outputChests[pos]
+                patch.outputChests[pos] = nil
+            end
 
             Storage.updateItemMaxima(surfaceData, newPatch)
         end
@@ -403,7 +426,7 @@ Storage.updateItemMaxima = function(surfaceData, patch)
         local control = entity.get_control_behavior()
         -- enabled combinators have their signals overriden with the storage-patche's content
         -- so only disabled combinators are used to control the item maxima
-        if not control.enabled then
+        if control and not control.enabled then
             for _, param in pairs(control.parameters.parameters) do
                 local signal = param.signal
                 if signal.type == "item" and signal.name then
@@ -435,6 +458,64 @@ function doOutput(patch, output, filter, linedef)
     patch.itemCount = patch.itemCount - 1
 end
 
+local CHEST_INVENTORY = defines.inventory.chest
+
+function doOutputChest(patch, chest)
+    local inventory = chest.get_inventory(CHEST_INVENTORY)
+    local content = inventory.get_contents()
+
+    for slotIndex = 1, 12 do
+        local request = chest.get_request_slot(slotIndex)
+        if request then
+            local item = request.name
+            local availableCount = patch.items[item] or 0
+            local transferCount = math.min(availableCount, request.count - (content[item] or 0))
+
+            if transferCount > 0 then
+                transferCount = inventory.insert({name = item, count = transferCount})
+                if transferCount > 0 then
+                    local remainingCount = availableCount - transferCount
+                    if remainingCount > 0 then
+                        patch.items[item] = remainingCount
+                    else
+                        patch.items[item] = nil
+                    end
+                    patch.itemCount = patch.itemCount - transferCount
+                end
+            end
+        end
+    end
+end
+
+function doInputChest(patch, chest, maxItems)
+    local inventory = chest.get_inventory(CHEST_INVENTORY)
+    local content = inventory.get_contents()
+    local defaultMax = patch.defaultItemMaximum or -1
+
+    for item, count in pairs(content) do
+        local transferCount = count
+
+        local storedCount = patch.items[item] or 0
+        local itemMax = patch.itemMaxima[item]
+        if not itemMax then 
+            itemMax = defaultMax
+        end
+        if itemMax >= 0 then
+            transferCount = math.min(transferCount, itemMax - storedCount)
+        end
+
+        transferCount = math.min(transferCount, maxItems - patch.itemCount)
+
+        if transferCount > 0 then
+            transferCount = inventory.remove({ name = item, count = transferCount})
+            if transferCount > 0 then
+                patch.items[item] = storedCount + transferCount
+                patch.itemCount = patch.itemCount + transferCount
+            end
+        end
+    end
+end
+
 function doInput(patch, input, maxItems, linedef)
     if patch.itemCount >= maxItems then return end
 
@@ -446,7 +527,7 @@ function doInput(patch, input, maxItems, linedef)
 
     local count = patch.items[item] or 0
     local itemMax = patch.itemMaxima[item]
-    local defaultMax = patch.defaultItemMaximum
+    local defaultMax = patch.defaultItemMaximum or -1
 
     if (itemMax 
             and count >= itemMax) 
@@ -472,6 +553,16 @@ function tick(event)
 
     for _, surfaceData in pairs(perSurface) do
         for _, patch in pairs(surfaceData.patches) do
+            -- TODO remove dev migration code
+            if not patch.inputChests then patch.inputChests = {} end
+            if not patch.outputChests then patch.outputChests = {} end
+
+            if isCircuitNetworkUpdateTick then
+                for _, chest in pairs(patch.outputChests) do
+                    doOutputChest(patch, chest)
+                end
+            end
+
             for _, output in pairs(patch.loaders) do
                 if output.valid and output.loader_type == "output" then
                     doOutput(patch, output, 1, LEFT_LINE)
@@ -480,6 +571,12 @@ function tick(event)
             end
 
             local maxItems = patch.tileCount * tileCapacity
+
+            if isCircuitNetworkUpdateTick then
+                for _, chest in pairs(patch.inputChests) do
+                    doInputChest(patch, chest, maxItems)
+                end
+            end
 
             for _, input in pairs(patch.loaders) do
                 if input.valid and input.loader_type == "input" then
@@ -498,12 +595,15 @@ function tick(event)
                 for item, count in pairs(patch.items) do
                     signals[index] = {index = index, signal = {type = "item", name = item}, count = count}
                     index = index+1
+                    if index > 18 then break end -- constant-combinator only has 18 slots, TODO what to do with surplus signals?
                 end
 
-                for _, scanner in pairs(patch.scanners) do
+                for spos, scanner in pairs(patch.scanners) do
                     if scanner.valid then
                         local control = scanner.get_control_behavior()
-                        if control.enabled then
+                        if not control then 
+                            player_print("no control: " .. scanner.name .. " " .. posToString(pos))
+                        elseif control.enabled then
                             control.parameters = {parameters = signals}
                         end
                     end
@@ -593,9 +693,9 @@ function entity_mined(event)
         local surfaceData, patch, pos = getPatchUnderEntity(entity)
         if surfaceData then
             accessor(patch)[pos] = nil
-        end
-        if entity.name == "constant-combinator" then
-            Storage.updateItemMaxima(surfaceData, patch)
+            if entity.name == "constant-combinator" then
+                Storage.updateItemMaxima(surfaceData, patch)
+            end
         end
     end
 end
@@ -664,7 +764,7 @@ function dump(paramTable)
     if not surfaceData then return end
 
     for _, patch in pairs(surfaceData.patches) do
-        player_print("#" .. patch.id .. ": " .. patch.tileCount .. " tiles, " .. patch.itemCount .. " items")
+        player_print("#" .. patch.id .. ": " .. patch.tileCount .. " tiles, " .. patch.itemCount .. " items" .. ", max " .. patch.tileCount * settings.global["modular-underground-storage-tile-capacity"].value)
         
         local items = "   items: "
         for item, count in pairs(patch.items) do
@@ -687,6 +787,18 @@ function dump(paramTable)
             end
         end
         player_print(outputs)
+
+        local inChests = "   input-chests: "
+        for pos, entity in pairs(patch.inputChests) do
+            inChests = inChests .. posToString(pos) .. ", "
+        end
+        player_print(inChests)
+
+        local outChests = "   output-chests: "
+        for pos, entity in pairs(patch.outputChests) do
+            outChests = outChests .. posToString(pos) .. ", "
+        end
+        player_print(outChests)
     end
 end
 

@@ -8,19 +8,19 @@ local BASE_CONCRETE = data.raw["tile"]["concrete"]
 local BASE_CHEST = data.raw.item["steel-chest"]
 
 local function determineIngredients()
-    if data.raw["assembling-machine"]["electronics-machine-1"] then
-        return {
+    if data.raw["inserter"]["red-filter-inserter"] then
+        return { -- Bob's inserter overhaul is active
             { "red-filter-inserter", 5 },
+            { "fast-transport-belt", 5 },
             { "concrete", 10 },
-            { "red-wire", 20 },
-            { "green-wire", 20 },
+            { "copper-cable", 20 },
         }
     else 
         return {
             { "filter-inserter", 6 },
+            { "fast-transport-belt", 5 },
             { "concrete", 10 },
-            { "red-wire", 20 },
-            { "green-wire", 20 },
+            { "copper-cable", 20 },
         }
     end
 end
