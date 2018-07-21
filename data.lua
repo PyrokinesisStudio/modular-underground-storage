@@ -3,3 +3,6 @@
 -- file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 require("prototypes.tiles")
+require("prototypes.controller")
+
+-- log( serpent.block( data.raw, {comment = false, numformat = '%1.4g' } ) )

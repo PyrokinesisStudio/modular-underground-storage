@@ -27,6 +27,25 @@ end
 
 data:extend({
     {
+        type = "custom-input",
+        name = "underground-storage-gui-open",
+        key_sequence = "",
+        linked_game_control = "open-gui"
+    },
+    {
+        type = "custom-input",
+        name = "underground-storage-gui-close",
+        key_sequence = "",
+        linked_game_control = "close-gui"
+    },
+    {
+        type = "custom-input",
+        name = "underground-storage-toggle-menu",
+        key_sequence = "",
+        linked_game_control = "toggle-menu"
+    },    
+
+    {
         type = "tile",
         name = "modular-underground-storage-tile",
         needs_correction = false,

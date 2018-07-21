@@ -3,10 +3,15 @@
 -- file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 local perSurface = {}
+local gui = nil
 
 local MOD = "modular-underground-storage"
 local TILE = "modular-underground-storage-tile"
 local TILE_STACK = { name = TILE }
+
+local ITEM_MAX_SOURCE = {}
+ITEM_MAX_SOURCE["constant-combinator"] = true
+ITEM_MAX_SOURCE["large-constant-combinator"] = true
 
 local LOADERS = {}
 LOADERS["deadlock-loader-1"] = function(patch) return patch.loaders end
@@ -14,18 +19,26 @@ LOADERS["deadlock-loader-2"] = LOADERS["deadlock-loader-1"]
 LOADERS["deadlock-loader-3"] = LOADERS["deadlock-loader-1"]
 LOADERS["deadlock-loader-4"] = LOADERS["deadlock-loader-1"]
 LOADERS["deadlock-loader-5"] = LOADERS["deadlock-loader-1"]
+
 LOADERS["constant-combinator"] = function(patch) return patch.scanners end
+LOADERS["large-constant-combinator"] = LOADERS["constant-combinator"]
 LOADERS["logistic-chest-buffer"] = function(patch) return patch.outputChests end
 LOADERS["logistic-chest-requester"] = LOADERS["logistic-chest-buffer"]
 LOADERS["steel-chest"] = function(patch) return patch.inputChests end
 LOADERS["infinity-chest"] = LOADERS["steel-chest"]
 LOADERS["logistic-chest-storage"] = LOADERS["steel-chest"]
 
+-- Storage Energistics Mod
+LOADERS["entity_se_requester_chest"] = LOADERS["logistic-chest-buffer"]
+LOADERS["entity_se_interface_chest"] = LOADERS["steel-chest"]
+LOADERS["entity_se_chest_mk1"] = LOADERS["steel-chest"]
+LOADERS["entity_se_chest_mk2"] = LOADERS["steel-chest"]
+
 -- This code uses positions as table keys.
 -- Because Lua compares tables by their reference only that means positions have to be encoded as numbers.
 -- Factorio runs scripts in Lua 5.2 which means numbers are float64.
 -- A float holds up to 52 significant bits so use half of them for the y coordinate.
--- Lua 5.2 has no bit shift operations so we have fall back to multiplication.
+-- Lua 5.2 has no bit shift operations so we have to fall back to multiplication.
 local Y_SHIFT = 2^26
 local Y_SHIFT_HALF = Y_SHIFT / 2
 
@@ -423,7 +436,7 @@ Storage.updateItemMaxima = function(surfaceData, patch)
     patch.defaultItemMaximum = -1
 
     for _, entity in pairs(patch.scanners) do
-        local control = entity.get_control_behavior()
+        local control = entity.valid and entity.get_control_behavior()
         -- enabled combinators have their signals overriden with the storage-patche's content
         -- so only disabled combinators are used to control the item maxima
         if control and not control.enabled then
@@ -595,16 +608,33 @@ function tick(event)
                 for item, count in pairs(patch.items) do
                     signals[index] = {index = index, signal = {type = "item", name = item}, count = count}
                     index = index+1
-                    if index > 18 then break end -- constant-combinator only has 18 slots, TODO what to do with surplus signals?
                 end
+
+                truncatedSignals = {}
 
                 for spos, scanner in pairs(patch.scanners) do
                     if scanner.valid then
                         local control = scanner.get_control_behavior()
+
+                        local maxSignals = control.signals_count
+                        local params
+                        if #signals > maxSignals then
+                            params = truncatedSignals[maxSignals]
+                            if not params then
+                                params = {}
+                                for i=1,maxSignals do
+                                    params[i] = signals[i]
+                                end
+                                truncatedSignals[maxSignals] = params
+                            end
+                        else
+                            params = signals
+                        end
+
                         if not control then 
                             player_print("no control: " .. scanner.name .. " " .. posToString(pos))
                         elseif control.enabled then
-                            control.parameters = {parameters = signals}
+                            control.parameters = {parameters = params}
                         end
                     end
                 end
@@ -693,7 +723,7 @@ function entity_mined(event)
         local surfaceData, patch, pos = getPatchUnderEntity(entity)
         if surfaceData then
             accessor(patch)[pos] = nil
-            if entity.name == "constant-combinator" then
+            if ITEM_MAX_SOURCE[entity.name] then
                 Storage.updateItemMaxima(surfaceData, patch)
             end
         end
@@ -702,7 +732,7 @@ end
 
 function gui_closed(event)
     local entity = event.entity
-    if not (entity and entity.valid and entity.name == "constant-combinator") then return end
+    if not (entity and entity.valid and ITEM_MAX_SOURCE[entity.name]) then return end
 
     local surfaceData, patch, pos = getPatchUnderEntity(entity)
     if not surfaceData then return end
@@ -728,7 +758,62 @@ script.on_event(defines.events.on_robot_mined_entity, entity_mined)
 
 script.on_event(defines.events.on_tick, tick)
 script.on_event(defines.events.on_gui_closed, gui_closed)
--- no need to handle mined_entity events, the tick function removes entities that are no longer .valid
+
+local open_gui = function(event)
+    if true or gui then return end
+
+    local player = game.players[event.player_index]
+    local entity = player.selected
+    if not entity then return end
+
+    local surfaceData, patch, pos = getPatchUnderEntity(entity)
+    if not surfaceData then return end
+
+    local frame = player.gui.center.add({type = "frame", name="mus-patch-config", caption = "Patch " .. patch.id, direction = "vertical" })
+    frame.style.minimal_width = 400
+    gui = frame
+
+    local top = gui.add({type = "flow", name="mus-patch-config-top", direction = "horizontal" })
+    
+    local preview = top.add({type = "entity-preview", name ="mus-patch-config-preview"})
+    preview.entity = entity
+
+    local signal_page = top.add({type = "slider", name ="mus-patch-config-page", minimum_value = 1, maximum_value = 100, value = 1})
+    local signal_page_box = top.add({type = "text-box", name ="mus-patch-config-page-box", text = 1})
+    signal_page_box.style.minimal_width = 50
+
+    local middle = gui.add({type = "flow", name="mus-patch-config-middle", direction = "horizontal" })
+    middle.style.top_padding = 0
+    middle.style.right_padding = 0
+    middle.style.bottom_padding = 0
+    middle.style.left_padding = 0
+
+    local e
+    e = middle.add({type = "choose-elem-button", name ="mus-patch-config-elem-1", elem_type = "item"})
+    e.style.top_padding = 0
+    e.style.right_padding = 0
+    e.style.bottom_padding = 0
+    e.style.left_padding = 0
+
+    e = middle.add({type = "choose-elem-button", name ="mus-patch-config-elem-2", elem_type = "item"})
+    e.style.top_padding = 0
+    e.style.right_padding = 0
+    e.style.bottom_padding = 0
+    e.style.left_padding = 0
+
+    gui.focus()
+end
+
+local close_gui = function(event) 
+    if gui then 
+        gui.destroy() 
+        gui = nil
+    end
+end
+
+script.on_event("underground-storage-gui-open", open_gui)
+script.on_event("underground-storage-gui-close", close_gui)
+script.on_event("underground-storage-toggle-menu", close_gui)
 
 local texts = {}
 
